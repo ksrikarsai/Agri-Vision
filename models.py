@@ -66,7 +66,6 @@ class RolePermission(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),
-        db.Index("ix_role_permissions_permission_id", "permission_id"),
     )
 
 
@@ -82,7 +81,6 @@ class UserRole(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("user_id", "role_id", name="uq_user_role"),
-        db.Index("ix_user_roles_role_id", "role_id"),
     )
 
 

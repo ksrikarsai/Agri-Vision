@@ -110,6 +110,29 @@ def load_user(user_id):
     from models import User
     return User.query.get(user_id)
 
+# --- Google OAuth 2.0 Configuration (issue #626) ---
+from authlib.integrations.flask_client import OAuth as _OAuth
+
+_oauth = _OAuth(app)
+_google_client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+_google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+
+if _google_client_id and _google_client_secret:
+    _oauth.register(
+        name="google",
+        client_id=_google_client_id,
+        client_secret=_google_client_secret,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+    GOOGLE_OAUTH_ENABLED = True
+    logger.info("Google OAuth 2.0 enabled.")
+else:
+    GOOGLE_OAUTH_ENABLED = False
+    logger.warning(
+        "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google OAuth disabled."
+    )
+
 from functools import wraps
 
 def api_login_required(f):
@@ -740,9 +763,19 @@ def read_validated_upload_image(file_storage) -> Tuple[str, np.ndarray, np.ndarr
         max_bytes=max_bytes,
     )
     temp_path = save_temp_upload(file_bytes, app.config["UPLOAD_TMP_DIR"], safe_filename)
+
+    try:
+        img = Image.open(BytesIO(file_bytes))
+        img.verify()
+    except Exception:
+        raise UploadValidationError(
+            "Unable to process this image. It may be corrupt or in an unsupported format.",
+            status_code=400,
+        )
+
     image = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
     if image is None:
-        raise UploadValidationError("Invalid image file.", status_code=400)
+        raise UploadValidationError("Unable to process this image. It may be corrupt or in an unsupported format.", status_code=400)
     return safe_filename, image, cv2.cvtColor(image, cv2.COLOR_BGR2RGB), temp_path
 
 
@@ -1354,9 +1387,375 @@ def export_pdf():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/history")
-def history():
-    return render_template("history.html")
+@app.route("/api/analyze/download-report", methods=["POST"])
+@login_required
+def download_analysis_report():
+    """Generate and download a professional PDF crop analysis report"""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+            Image as RLImage,
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER
+        from io import BytesIO
+        import base64
+        from PIL import Image as PILImage
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+
+        disease_detected = data.get("disease_detected", "Unknown")
+        disease_confidence = data.get("disease_confidence", 0)
+        health_score = data.get("health_score", 0)
+        growth_stage = data.get("growth_stage", "Unknown")
+        growth_confidence = data.get("growth_confidence", 0)
+        image_b64 = data.get("image_b64", "")
+        recommendations = data.get("recommendations", [])
+        timestamp = data.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        weather_data = data.get("weather_data", {})
+        yield_data = data.get("yield_estimate", {})
+
+        pdf_buffer = BytesIO()
+        doc = SimpleDocTemplate(
+            pdf_buffer, pagesize=letter, topMargin=0.5 * inch, bottomMargin=0.5 * inch
+        )
+        elements = []
+
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle(
+            "CustomTitle",
+            parent=styles["Heading1"],
+            fontSize=24,
+            textColor=colors.HexColor("#2c3e50"),
+            spaceAfter=6,
+            alignment=TA_CENTER,
+            fontName="Helvetica-Bold",
+        )
+        subtitle_style = ParagraphStyle(
+            "CustomSubtitle",
+            parent=styles["Normal"],
+            fontSize=12,
+            textColor=colors.HexColor("#7f8c8d"),
+            spaceAfter=12,
+            alignment=TA_CENTER,
+            fontName="Helvetica",
+        )
+        header_style = ParagraphStyle(
+            "SectionHeader",
+            parent=styles["Heading2"],
+            fontSize=14,
+            textColor=colors.HexColor("#27ae60"),
+            spaceAfter=8,
+            spaceBefore=12,
+            fontName="Helvetica-Bold",
+        )
+        normal_style = ParagraphStyle(
+            "Normal",
+            parent=styles["Normal"],
+            fontSize=10,
+            textColor=colors.HexColor("#2c3e50"),
+            spaceAfter=6,
+        )
+
+        title = Paragraph("🌾 Agri-Vision Crop Analysis Report", title_style)
+        elements.append(title)
+        subtitle = Paragraph("Professional Analysis Insights", subtitle_style)
+        elements.append(subtitle)
+        elements.append(Spacer(1, 0.15 * inch))
+
+        metadata_data = [
+            ["Report Generated", timestamp],
+            ["Analysis ID", f"AGRI-{datetime.now().strftime('%Y%m%d%H%M%S')}"],
+        ]
+        metadata_table = Table(metadata_data, colWidths=[2 * inch, 4 * inch])
+        metadata_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#ecf0f1")),
+                    ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#2c3e50")),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#bdc3c7")),
+                ]
+            )
+        )
+        elements.append(metadata_table)
+        elements.append(Spacer(1, 0.2 * inch))
+
+        if image_b64:
+            try:
+                # Decoded Original Image
+                orig_data = base64.b64decode(
+                    image_b64.split(",")[-1] if "," in image_b64 else image_b64
+                )
+                orig_pil = PILImage.open(BytesIO(orig_data))
+                
+                # If Grad-CAM overlay image is also provided
+                if gradcam_image_b64:
+                    gc_data = base64.b64decode(
+                        gradcam_image_b64.split(",")[-1] if "," in gradcam_image_b64 else gradcam_image_b64
+                    )
+                    gc_pil = PILImage.open(BytesIO(gc_data))
+                    
+                    # Create side-by-side RLImages of 2.85 inches wide
+                    w = 2.85 * inch
+                    h = w * orig_pil.height / orig_pil.width
+                    if h > 2.2 * inch:
+                        h = 2.2 * inch
+                        w = h * orig_pil.width / orig_pil.height
+                        
+                    rl_orig = RLImage(BytesIO(orig_data), width=w, height=h)
+                    rl_gc = RLImage(BytesIO(gc_data), width=w, height=h)
+                    
+                    # Create a side-by-side table
+                    image_table_data = [
+                        [Paragraph("<b>Original Leaf Image</b>", normal_style), Paragraph("<b>Explainable AI (Grad-CAM Overlay)</b>", normal_style)],
+                        [rl_orig, rl_gc]
+                    ]
+                    img_table = Table(image_table_data, colWidths=[3 * inch, 3 * inch])
+                    img_table.setStyle(TableStyle([
+                        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                        ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ]))
+                    elements.append(img_table)
+                else:
+                    # Single original image standard display
+                    img_width = 6 * inch
+                    img_height = img_width * orig_pil.height / orig_pil.width
+                    if img_height > 3.5 * inch:
+                        img_height = 3.5 * inch
+                        img_width = img_height * orig_pil.width / orig_pil.height
+                    
+                    rl_orig = RLImage(BytesIO(orig_data), width=img_width, height=img_height)
+                    elements.append(rl_orig)
+                
+                elements.append(Spacer(1, 0.15 * inch))
+            except Exception as e:
+                logger.warning(f"Could not embed image in PDF: {e}")
+
+        elements.append(Paragraph("DISEASE HEALTH ANALYSIS", header_style))
+        disease_data = [
+            ["Detected Issue", str(disease_detected)],
+            ["Confidence Score", f"{float(disease_confidence):.1f}%"],
+            ["Health Score", f"{float(health_score):.1f}%"],
+        ]
+        disease_table = Table(disease_data, colWidths=[2 * inch, 4 * inch])
+        disease_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e8f5e9")),
+                    ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#1b5e20")),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 10),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#a5d6a7")),
+                ]
+            )
+        )
+        elements.append(disease_table)
+        elements.append(Spacer(1, 0.15 * inch))
+
+        elements.append(Paragraph("GROWTH STAGE DETECTION", header_style))
+        growth_data = [
+            ["Current Stage", str(growth_stage)],
+            ["Stage Confidence", f"{float(growth_confidence):.1f}%"],
+        ]
+        growth_table = Table(growth_data, colWidths=[2 * inch, 4 * inch])
+        growth_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e3f2fd")),
+                    ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#1565c0")),
+                    ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 10),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 8),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#90caf9")),
+                ]
+            )
+        )
+        elements.append(growth_table)
+        elements.append(Spacer(1, 0.15 * inch))
+
+        if weather_data:
+            elements.append(Paragraph("WEATHER CONDITIONS", header_style))
+            weather_rows = []
+            if weather_data.get("temperature") is not None:
+                weather_rows.append(
+                    ["Temperature", f"{weather_data.get('temperature')}°C"]
+                )
+            if weather_data.get("humidity") is not None:
+                weather_rows.append(["Humidity", f"{weather_data.get('humidity')}%"])
+            if weather_data.get("precipitation") is not None:
+                weather_rows.append(
+                    ["Precipitation", f"{weather_data.get('precipitation')} mm"]
+                )
+            if weather_data.get("description"):
+                weather_rows.append(["Condition", weather_data.get("description")])
+
+            if weather_rows:
+                weather_table = Table(weather_rows, colWidths=[2 * inch, 4 * inch])
+                weather_table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#fff3e0")),
+                            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#e65100")),
+                            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 10),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                            ("TOPPADDING", (0, 0), (-1, -1), 8),
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#ffe0b2")),
+                        ]
+                    )
+                )
+                elements.append(weather_table)
+                elements.append(Spacer(1, 0.15 * inch))
+
+        if yield_data:
+            elements.append(Paragraph("YIELD ESTIMATE", header_style))
+            yield_rows = []
+            if yield_data.get("yield_min_acre") and yield_data.get("yield_max_acre"):
+                yield_rows.append(
+                    [
+                        "Per Acre Estimate",
+                        f"{yield_data.get('yield_min_acre')}–{yield_data.get('yield_max_acre')} q/acre",
+                    ]
+                )
+            if yield_data.get("yield_min_total") and yield_data.get("yield_max_total"):
+                yield_rows.append(
+                    [
+                        "Total Field Estimate",
+                        f"{yield_data.get('yield_min_total')}–{yield_data.get('yield_max_total')} quintals",
+                    ]
+                )
+
+            if yield_rows:
+                yield_table = Table(yield_rows, colWidths=[2 * inch, 4 * inch])
+                yield_table.setStyle(
+                    TableStyle(
+                        [
+                            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f3e5f5")),
+                            ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#4a148c")),
+                            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+                            ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                            ("FONTSIZE", (0, 0), (-1, -1), 10),
+                            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+                            ("TOPPADDING", (0, 0), (-1, -1), 8),
+                            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e1bee7")),
+                        ]
+                    )
+                )
+                elements.append(yield_table)
+                elements.append(Spacer(1, 0.15 * inch))
+
+        if recommendations:
+            elements.append(Paragraph("RECOMMENDATIONS", header_style))
+            rec_text = ""
+            for i, rec in enumerate(recommendations[:10], 1):
+                rec_text += f"• {rec}<br/>"
+            elements.append(Paragraph(rec_text, normal_style))
+            elements.append(Spacer(1, 0.1 * inch))
+
+        elements.append(Spacer(1, 0.2 * inch))
+        footer_text = "Generated by Agri-Vision Cotton Analysis System | For professional agricultural guidance, consult local extension officers"
+        elements.append(
+            Paragraph(
+                footer_text,
+                ParagraphStyle(
+                    "Footer",
+                    parent=styles["Normal"],
+                    fontSize=8,
+                    textColor=colors.HexColor("#95a5a6"),
+                    alignment=TA_CENTER,
+                ),
+            )
+        )
+
+        doc.build(elements)
+        pdf_buffer.seek(0)
+
+        return send_file(
+            pdf_buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f'agri_vision_crop_analysis_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf',
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating analysis PDF: {e}")
+        return jsonify({"error": f"Failed to generate PDF: {str(e)}"}), 500
+
+
+@app.route("/compare")
+@login_required
+def compare():
+    ids_param = request.args.get('ids', '')
+    if not ids_param:
+        flash("No analyses selected for comparison", "warning")
+        return redirect(url_for('history'))
+
+    analysis_ids = [aid.strip() for aid in ids_param.split(',') if aid.strip()]
+
+    from models import AnalysisHistory
+    analyses = AnalysisHistory.query.filter(
+        AnalysisHistory.id.in_(analysis_ids),
+        AnalysisHistory.user_id == current_user.id
+    ).all()
+
+    if not analyses:
+        flash("No valid analyses found", "warning")
+        return redirect(url_for('history'))
+
+    canonical_fields = [
+        ('disease', 'Detected Disease'),
+        ('growth_stage', 'Growth Stage'),
+        ('confidence', 'Confidence'),
+        ('health_score', 'Health Score'),
+        ('created_at', 'Analysis Date'),
+    ]
+
+    rows = []
+    for key, label in canonical_fields:
+        row = {"label": label, "key": key, "values": []}
+        for analysis in analyses:
+            if key == 'disease':
+                val = (analysis.disease_result or {}).get('predicted_class')
+            elif key == 'growth_stage':
+                val = (analysis.growth_result or {}).get('main_class')
+            elif key == 'confidence':
+                val = analysis.confidence
+            elif key == 'health_score':
+                val = analysis.health_score
+            elif key == 'created_at':
+                val = analysis.created_at.strftime('%Y-%m-%d %H:%M') if analysis.created_at else None
+            else:
+                val = None
+            row["values"].append(val)
+        rows.append(row)
+
+    return render_template('compare.html',
+        analyses=analyses,
+        rows=rows,
+        enumerate=enumerate,
+    )
 
 
 @app.route("/health")
@@ -1407,10 +1806,30 @@ def analyze():
             predicted_class = results.get("disease", {}).get("predicted_class", "") or ""
             disease_info = disease_info_map.get(predicted_class, {})
 
+            import time
+            unique_filename = f"{int(time.time())}_{safe_filename}"
+            file_path = os.path.join("static", "uploads", unique_filename)
+            cv2.imwrite(file_path, image)
+            
+            from models import AnalysisHistory, db
+            if current_user.is_authenticated:
+                history_entry = AnalysisHistory(
+                    user_id=current_user.id,
+                    image_path=unique_filename,
+                    disease_result=results.get("disease"),
+                    growth_result=results.get("growth"),
+                    confidence=results.get("disease", {}).get("confidence"),
+                    health_score=results.get("disease", {}).get("health_score")
+                )
+                db.session.add(history_entry)
+                db.session.commit()
+
             return render_template(
                 "results.html",
                 results=results,
                 filename=safe_filename,
+                unique_filename=unique_filename,
+                disease_classes=disease_classes,
                 image_b64=encode_image_for_display(image_rgb),
                 img_shape={"width": image.shape[1], "height": image.shape[0]},
                 raw_json=json.dumps(results, indent=2),
@@ -1421,13 +1840,15 @@ def analyze():
                 disease_info=disease_info,
             )
         except UploadValidationError as exc:
-            logger.warning("Upload rejected: %s", exc)
+            filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+            logger.warning("Upload rejected (user=%s, file=%s): %s", current_user.id, filename, exc)
             if exc.status_code == 413:
                 return ("File too large", 413)
             flash(str(exc), "error")
             return redirect(request.url)
         except Exception as exc:
-            logger.error("Analysis error: %s", exc)
+            filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+            logger.error("Analysis error (user=%s, file=%s): %s", current_user.id, filename, exc)
             flash(f"Error during analysis: {str(exc)}", "error")
             return redirect(request.url)
         finally:
@@ -1472,6 +1893,78 @@ def api_explain():
         })
     except Exception as exc:
         logger.error("Error in API explain endpoint: %s", exc)
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
+@app.route("/api/explain/target", methods=["POST"])
+def api_explain_target():
+    """Dynamically generate Grad-CAM for a specified target disease class index"""
+    try:
+        data = request.get_json() or {}
+        image_path = data.get("image_path")
+        target_class_idx = data.get("target_class_idx")
+        
+        if not image_path:
+            return jsonify({"status": "error", "error": "No image_path provided"}), 400
+        if target_class_idx is None:
+            return jsonify({"status": "error", "error": "No target_class_idx provided"}), 400
+            
+        try:
+            target_class_idx = int(target_class_idx)
+            if not (0 <= target_class_idx < len(disease_classes)):
+                return jsonify({"status": "error", "error": "Invalid target_class_idx"}), 400
+        except ValueError:
+            return jsonify({"status": "error", "error": "target_class_idx must be an integer"}), 400
+            
+        from werkzeug.utils import secure_filename
+        safe_filename = secure_filename(image_path)
+        full_image_path = os.path.join("static", "uploads", safe_filename)
+        if not os.path.exists(full_image_path):
+            return jsonify({"status": "error", "error": f"Original image file not found: {safe_filename}"}), 404
+            
+        image = cv2.imread(full_image_path)
+        if image is None:
+            return jsonify({"status": "error", "error": "Failed to read original image file"}), 500
+            
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if model_manager.resnet_model is None:
+            return jsonify({"status": "error", "error": "Classification model is not loaded"}), 500
+            
+        input_tensor = preprocess_image_for_resnet(image_rgb)
+        
+        from services.gradcam import generate_gradcam_explanation
+        import hashlib
+        image_hash = hashlib.sha256(image_rgb.tobytes()).hexdigest()
+        
+        gradcam_result = generate_gradcam_explanation(
+            model=model_manager.resnet_model,
+            input_tensor=input_tensor,
+            image_rgb=image_rgb,
+            target_class_idx=target_class_idx,
+            filename_prefix=f"{image_hash[:16]}_{target_class_idx}",
+        )
+        
+        if (
+            gradcam_result.available
+            and gradcam_result.overlay_image is not None
+            and gradcam_result.heatmap_image is not None
+        ):
+            overlay_b64 = encode_image_for_display(gradcam_result.overlay_image)
+            heatmap_only_b64 = encode_image_for_display(gradcam_result.heatmap_image)
+            
+            return jsonify({
+                "status": "success",
+                "overlay_b64": overlay_b64,
+                "heatmap_only_b64": heatmap_only_b64,
+                "target_class": disease_classes[target_class_idx],
+                "target_layer": gradcam_result.target_layer
+            })
+        else:
+            return jsonify({"status": "error", "error": gradcam_result.error or "Failed to generate Grad-CAM explanation"}), 500
+            
+    except Exception as exc:
+        logger.error("Dynamic target Grad-CAM generation failed: %s", exc)
         return jsonify({"status": "error", "error": str(exc)}), 500
 
 
@@ -1795,10 +2288,12 @@ def api_analyze():
             
         })
     except UploadValidationError as exc:
-        logger.warning("API upload rejected: %s", exc)
+        filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+        logger.warning("API upload rejected (file=%s): %s", filename, exc)
         return jsonify({"error": str(exc)}), exc.status_code
     except Exception as e:
-        logger.error(f"API analysis error: {e}")
+        filename = request.files.get("file", {}).filename if request.files.get("file") else "unknown"
+        logger.error("API analysis error (file=%s): %s", filename, e)
         return jsonify({"error": str(e)}), 500
     finally:
         cleanup_temp_upload(temp_path)
@@ -2001,6 +2496,96 @@ def api_batch_results(job_id):
         'results': results
     })
 
+@app.route("/api/batch_status/<job_id>/stream", methods=["GET"])
+@login_required
+def api_batch_status_stream(job_id):
+    """Stream real-time status and results for a batch job using Server-Sent Events (SSE)"""
+    from models import BatchJob, db
+    import json
+    import time
+    
+    # Check if job exists
+    job = BatchJob.query.get(job_id)
+    if not job:
+        return jsonify({"error": "Batch job not found"}), 404
+        
+    def event_generator():
+        while True:
+            payload = None
+            is_finished = False
+            
+            # We must run database queries within app_context
+            with app.app_context():
+                # Refresh job from DB
+                db.session.expire_all()
+                current_job = BatchJob.query.get(job_id)
+                if not current_job:
+                    payload = {"error": "Job deleted"}
+                    is_finished = True
+                else:
+                    # Update completed/failed counts
+                    results = current_job.results
+                    completed = len([r for r in results if r.status in ("complete", "success")])
+                    failed = len([r for r in results if r.status == "error"])
+                    
+                    # Check completion status
+                    if completed + failed >= current_job.total_images and current_job.total_images > 0:
+                        current_job.status = "completed"
+                        if not current_job.completed_at:
+                            current_job.completed_at = datetime.utcnow()
+                        db.session.commit()
+                    
+                    job_dict = current_job.to_dict()
+                    # Include total, completed, failed counts in job_dict
+                    job_dict["completed_images"] = completed
+                    job_dict["failed_images"] = failed
+                    
+                    # Also include per-image results that are already processed or processing so far
+                    results_list = []
+                    for r in results:
+                        results_list.append({
+                            "id": r.id,
+                            "image_name": r.image_name,
+                            "image_index": r.image_index,
+                            "status": r.status,
+                            "disease_class": r.disease_class,
+                            "disease_confidence": r.disease_confidence,
+                            "health_score": r.health_score,
+                            "growth_class": r.growth_class,
+                            "growth_confidence": r.growth_confidence,
+                            "error_message": r.error_message,
+                            "results": r.results_json
+                        })
+                    
+                    results_list.sort(key=lambda x: x["image_index"])
+                    
+                    payload = {
+                        "job": job_dict,
+                        "results": results_list
+                    }
+                    
+                    if current_job.status in ("completed", "failed"):
+                        is_finished = True
+            
+            # Yield outside the app context block to prevent AssertionError on GeneratorExit teardown
+            if "error" in payload:
+                yield "event: error\ndata: " + json.dumps(payload) + "\n\n"
+            else:
+                yield f"data: {json.dumps(payload)}\n\n"
+                
+            if is_finished:
+                break
+                
+            time.sleep(1.0)
+            
+    return Response(stream_with_context(event_generator()), mimetype="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    })
+
+
+
 @app.route("/api/batch_results/<job_id>/export/csv", methods=["GET"])
 def export_batch_csv(job_id):
     """Export batch results as CSV"""
@@ -2178,7 +2763,76 @@ def login():
         else:
             flash('Invalid email or password', 'danger')
     
-    return render_template('login.html')
+    return render_template('login.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
+
+
+@app.route("/auth/google")
+def auth_google():
+    """Redirect to Google's OAuth 2.0 consent screen."""
+    if not GOOGLE_OAUTH_ENABLED:
+        flash("Google Sign-In is not configured on this server.", "warning")
+        return redirect(url_for("login"))
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    redirect_uri = url_for("auth_google_callback", _external=True)
+    return _oauth.google.authorize_redirect(redirect_uri)
+
+
+@app.route("/auth/google/callback")
+def auth_google_callback():
+    """Handle the OAuth 2.0 callback from Google."""
+    if not GOOGLE_OAUTH_ENABLED:
+        flash("Google Sign-In is not configured on this server.", "warning")
+        return redirect(url_for("login"))
+
+    try:
+        token = _oauth.google.authorize_access_token()
+        user_info = token.get("userinfo") or _oauth.google.userinfo()
+    except Exception as exc:
+        logger.warning("Google OAuth callback error: %s", exc)
+        flash("Google Sign-In failed. Please try again.", "danger")
+        return redirect(url_for("login"))
+
+    google_id = str(user_info["sub"])
+    email = user_info.get("email", "")
+    full_name = user_info.get("name", email.split("@")[0])
+    picture = user_info.get("picture", "")
+
+    from models import User
+
+    # 1. Look up by OAuth provider + ID (most reliable)
+    user = User.query.filter_by(oauth_provider="google", oauth_id=google_id).first()
+
+    # 2. Fall back to matching by email (links existing password accounts)
+    if user is None and email:
+        user = User.query.filter_by(email=email).first()
+        if user:
+            user.oauth_provider = "google"
+            user.oauth_id = google_id
+            if picture:
+                user.profile_picture = picture
+
+    # 3. Auto-create a new account for first-time Google users
+    if user is None:
+        user = User(
+            email=email,
+            full_name=full_name,
+            password_hash=None,
+            oauth_provider="google",
+            oauth_id=google_id,
+            profile_picture=picture,
+            role="farmer",
+            is_active=True,
+        )
+        db.session.add(user)
+
+    user.last_login = datetime.utcnow()
+    db.session.commit()
+
+    login_user(user)
+    logger.info("User %s signed in via Google OAuth.", user.email)
+    flash(f"Welcome, {user.full_name}! You are now signed in.", "success")
+    return redirect(url_for("index"))
 
 
 @app.route("/register", methods=["GET", "POST"])
@@ -2197,20 +2851,20 @@ def register():
         # Validation
         if not full_name or not email or not password:
             flash('All fields are required', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         if password != confirm_password:
             flash('Passwords do not match', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         if len(password) < 8:
             flash('Password must be at least 8 characters', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         from models import User
         if User.query.filter_by(email=email).first():
             flash('Email already registered', 'danger')
-            return render_template('register.html')
+            return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
         
         # Create user
         user = User(
@@ -2226,7 +2880,7 @@ def register():
         flash('Account created successfully! Please login.', 'success')
         return redirect(url_for('login'))
     
-    return render_template('register.html')
+    return render_template('register.html', google_oauth_enabled=GOOGLE_OAUTH_ENABLED)
 
 
 @app.route("/logout")

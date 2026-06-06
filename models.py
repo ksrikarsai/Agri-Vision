@@ -66,7 +66,6 @@ class RolePermission(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("role_id", "permission_id", name="uq_role_permission"),
-        db.Index("ix_role_permissions_permission_id", "permission_id"),
     )
 
 
@@ -82,7 +81,6 @@ class UserRole(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint("user_id", "role_id", name="uq_user_role"),
-        db.Index("ix_user_roles_role_id", "role_id"),
     )
 
 
@@ -94,12 +92,17 @@ class User(UserMixin, db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)  # Nullable for OAuth-only accounts
     full_name = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), default=ROLE_FARMER)  # farmer, researcher, admin
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_login = db.Column(db.DateTime, nullable=True)
     is_active = db.Column(db.Boolean, default=True)
+
+    # OAuth fields (populated when user signs in via Google)
+    oauth_provider = db.Column(db.String(32), nullable=True)   # e.g. "google"
+    oauth_id = db.Column(db.String(255), nullable=True, index=True)  # Provider's unique user ID
+    profile_picture = db.Column(db.String(500), nullable=True)  # Profile photo URL from provider
 
     # Relationships
     analyses = db.relationship(
@@ -113,8 +116,10 @@ class User(UserMixin, db.Model):
         self.password_hash = hashpw(password.encode("utf-8"), gensalt()).decode("utf-8")
 
     def check_password(self, password):
-        """Check if password matches hash"""
-        from bcrypt import checkpw, hashpw
+        """Check if password matches hash. Returns False for OAuth-only accounts."""
+        if not self.password_hash:
+            return False
+        from bcrypt import checkpw
 
         return checkpw(password.encode("utf-8"), self.password_hash.encode("utf-8"))
 
@@ -528,8 +533,52 @@ class RefreshTokenFamily(db.Model):
     )
 
 
+class DeviceSession(db.Model):
+    """Device-based session tracking linked to refresh token families."""
+
+    __tablename__ = "device_sessions"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.String(36), db.ForeignKey("users.id"), nullable=False, index=True)
+
+    # JWT access token claims
+    session_id = db.Column(db.String(64), nullable=False, index=True)
+
+    # Refresh token family linkage (revocation/compromise fan-out)
+    refresh_token_family_id = db.Column(
+        db.String(36),
+        db.ForeignKey("refresh_token_families.id"),
+        nullable=False,
+        index=True,
+    )
+
+    # Device metadata
+    device_name = db.Column(db.String(120), nullable=True)
+    browser_name = db.Column(db.String(60), nullable=True)
+    operating_system = db.Column(db.String(60), nullable=True)
+    device_type = db.Column(db.String(30), nullable=True)  # desktop, mobile, tablet
+    user_agent = db.Column(db.Text, nullable=True)
+
+    # Network / location (privacy-conscious, best-effort)
+    ip_address = db.Column(db.String(64), nullable=True)
+    country = db.Column(db.String(80), nullable=True)
+    city = db.Column(db.String(120), nullable=True)
+
+    # State
+    is_current = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    is_active = db.Column(db.Boolean, default=True, nullable=False, index=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    last_activity_at = db.Column(db.DateTime, nullable=True, index=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True, index=True)
+
+
 class RefreshToken(db.Model):
     """A single refresh token (hashed) with one-time use enforcement."""
+
 
     __tablename__ = "refresh_tokens"
 
